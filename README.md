@@ -17,7 +17,9 @@
 
 ---
 
-`@xeno-js/axios` provides integration with Axios within the Xeno.JS ecosystem. It handles outbound HTTP requests, automatic injection of tracing headers, and resilience policies via the Cockatiel library.
+`@xeno-js/axios` provides integration with Axios within the Xeno.JS ecosystem.
+It handles outbound HTTP requests, automatic injection of tracing headers, and
+resilience policies via the Cockatiel library.
 
 ## Installation
 
@@ -32,19 +34,35 @@ The package requires `@xeno-js/core` as a peer dependency.
 
 ## 1. HTTP Plugin Configuration and Axios Client
 
-**Problem.** Distributed applications require a centrally configured outbound HTTP client capable of automatically propagating tracing contexts (correlation ID, request ID) and managing XSRF tokens.
+**Problem.** Distributed applications require a centrally configured outbound
+HTTP client capable of automatically propagating tracing contexts (correlation
+ID, request ID) and managing XSRF tokens.
 
-**Principle.** HTTP client configuration must be declarative, isolated, and integrated into the application builder via dedicated plugins.
+**Principle.** HTTP client configuration must be declarative, isolated, and
+integrated into the application builder via dedicated plugins.
 
-**Mechanism.** The `withAxiosHttp` function defines an `http` type plugin that leverages `NodeAxiosFactory` to create Axios instances configured with interceptors for propagating the execution context (`RequestContext`).
+**Mechanism.** The `withAxiosHttp` function defines an `http` type plugin that
+leverages `NodeAxiosFactory` to create Axios instances configured with
+interceptors for propagating the execution context (`RequestContext`).
 
 **Implementation:**
 
 ```ts
-import { XenoAppBuilder } from '@xeno-js/core';
-import { withAxiosHttp } from '@xeno-js/axios';
+// src/registry.ts
+import type { IHandler, IPaginatedResult, XenoRegistry } from '@xeno-js/core'
+import type { GetProductsQuery, ProductDto } from './products'
 
-const app = await new XenoAppBuilder()
+export interface MyRegistry extends XenoRegistry {
+  GET_PRODUCTS: IHandler<GetProductsQuery, IPaginatedResult<ProductDto>>
+}
+
+// src/bootstrap.ts
+import { XenoAppBuilder } from '@xeno-js/core'
+import { withAxiosHttp } from '@xeno-js/axios'
+import { GetProductsHandler } from './products'
+import { MyRegistry } from './registry'
+
+const app = await new XenoAppBuilder<MyRegistry>()
   .addHttpClients(
     withAxiosHttp((clients) => {
       clients.push({
@@ -53,30 +71,95 @@ const app = await new XenoAppBuilder()
           baseURL: 'https://api.example.com',
           timeout: 5000,
         },
-      });
-    })
+      })
+    }),
   )
-  .build();
+  .addServices((opts) => {
+    opts.addScoped(
+      'GET_PRODUCTS',
+      (c) =>
+        new GetProductsHandler(
+          c.resolve('httpClientFactory').get('ApiClient'),
+          c.resolve('userContextFactory'),
+        ),
+    )
+  })
+  .build()
 
+// src/products/application/handlers/get-products.handler.ts
+import {
+  BaseHandler,
+  type IRemoteDataSource,
+  type UserContext,
+  type IFactory,
+  type ApiResponseDto,
+  Result,
+  AppError,
+  type IPaginatedResult,
+} from '@xeno-js/core'
+
+import type { GetProductsQuery } from '../query'
+import type { ProductDto } from '../../infrastructure'
+
+export class GetProductsHandler extends BaseHandler<
+  GetProductsQuery,
+  IPaginatedResult<ProductDto>
+> {
+  constructor(
+    private readonly _apiClient: IRemoteDataSource,
+    identityFactory: IFactory<void, UserContext>,
+  ) {
+    super(identityFactory)
+  }
+
+  async executeAsync(query: GetProductsQuery, signal: AbortSignal) {
+    const result = await this._apiClient.get<
+      ApiResponseDto<IPaginatedResult<ProductDto>>
+    >('/v1/products', {
+      query: { page: query.page, pageSize: query.pageSize },
+      signal,
+    })
+
+    if (!result.isOk())
+      return Result.fail<IPaginatedResult<ProductDto>, AppError>(
+        result.getErrorOrThrow(),
+      )
+
+    const responseData = result.getValueOrThrow() as {
+      data: IPaginatedResult<ProductDto>
+    }
+    return Result.ok(responseData.data)
+  }
+}
 ```
 
-**Behavior:** During the request, the interceptor automatically injects tracing headers (`x-correlation-id`, `x-request-id`, `x-span-id`, etc.) into the headers by retrieving them from `AsyncLocalStorage` via the active context.
+**Behavior:** During the request, the interceptor automatically injects tracing
+headers (`x-correlation-id`, `x-request-id`, `x-span-id`, etc.) into the headers
+by retrieving them from `AsyncLocalStorage` via the active context.
 
-**Boundary:** This package exclusively manages the outbound HTTP client and associated resilience, delegating the reception and routing of server-side HTTP requests to dedicated transport adapters (e.g., Fastify or Node HTTP).
+**Boundary:** This package exclusively manages the outbound HTTP client and
+associated resilience, delegating the reception and routing of server-side HTTP
+requests to dedicated transport adapters (e.g., Fastify or Node HTTP).
 
 ---
 
 ## 2. Resilience Policies (Cockatiel)
 
-**Problem.** Network calls to external services are subject to transient failures, timeouts, or overloads that can cause cascading failures in the architecture.
+**Problem.** Network calls to external services are subject to transient
+failures, timeouts, or overloads that can cause cascading failures in the
+architecture.
 
-**Principle.** Network calls must be protected by automatic retry, circuit breaker, and bulkhead mechanisms to ensure error tolerance.
+**Principle.** Network calls must be protected by automatic retry, circuit
+breaker, and bulkhead mechanisms to ensure error tolerance.
 
-**Mechanism:** `CockatielResilienceFactory` encapsulates the Cockatiel library to apply wrapped policies (`wrap`), handling selective transient failures based on idempotent HTTP methods and returned error codes.
+**Mechanism:** `CockatielResilienceFactory` encapsulates the Cockatiel library
+to apply wrapped policies (`wrap`), handling selective transient failures based
+on idempotent HTTP methods and returned error codes.
 
 **Implementation:**
 
-Resilience policies can be configured directly in the client definition within the plugin:
+Resilience policies can be configured directly in the client definition within
+the plugin:
 
 ```ts
 withAxiosHttp((clients) => {
@@ -88,14 +171,17 @@ withAxiosHttp((clients) => {
       circuitBreaker: { threshold: 5, halfOpenAfter: 10000 },
       bulkhead: { limit: 10, queue: 10 },
     },
-  });
+  })
 })
-
 ```
 
-**Behavior:** If a call fails due to a transient error (e.g., timeout or eligible server-side error codes), the policy steps in by performing incremental attempts (exponential backoff) or opening the circuit if the consecutive failure threshold is exceeded.
+**Behavior:** If a call fails due to a transient error (e.g., timeout or
+eligible server-side error codes), the policy steps in by performing incremental
+attempts (exponential backoff) or opening the circuit if the consecutive failure
+threshold is exceeded.
 
-**Boundary:** Resilience policies apply solely to operations executed via the configured client, without altering the internal logic of business handlers.
+**Boundary:** Resilience policies apply solely to operations executed via the
+configured client, without altering the internal logic of business handlers.
 
 ---
 
